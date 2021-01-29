@@ -113,22 +113,33 @@ def parse_args():
 def main(args):
     # load model and input
     model = torch.jit.load(args.model_file_path)
-    inp = torch.randn([args.batch_size] + args.input_shape)
+    batch = torch.randn([args.batch_size] + args.input_shape)
 
     # set device
     model = model.to(args.device)
-    inp = inp.to(args.device)
 
     # benchmark
     results = BenchmarkResults()
     LOGGER.info("Benchmarking...")
     for step in trange(args.num_warmup_iterations + args.num_iterations):
+        inp = batch.to(args.device)
+        if inp.is_cuda:
+            torch.cuda.synchronize()
+
         start = time.time()
         outputs = model(inp)
+        if inp.is_cuda:
+            torch.cuda.synchronize()
         end = time.time()
 
         if step >= args.num_warmup_iterations:
             results.append_batch(start, end, args.batch_size)
+
+        if inp.is_cuda:
+            torch.cuda.synchronize()
+
+        del inp
+        del outputs
 
     LOGGER.info(f"Benchmarking complete. Results:\n{results}")
 
