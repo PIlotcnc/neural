@@ -56,12 +56,17 @@ class QuantizationModifier(ScheduledModifier):
     | Sample yaml:
     |   !QuantizationModifier
     |       start_epoch: 0.0
+    |       calibration_epochs: 0.25
     |       submodules: ['blocks.0', 'blocks.2']
     |       model_fuse_fn_name: 'fuse_module'
     |       disable_quantization_observer_epoch: 2.0
     |       freeze_bn_stats_epoch: 3.0
 
     :param start_epoch: The epoch to start the modifier at
+    :param calibration_epochs: The number of epochs to calibrate quantization parameters
+        for - trainable weights will be frozen, while quantized activation scales
+        adjust. Starts immediately on start_epoch. Can be fractional, i.e. 0.35. Default
+        is 0.0
     :param submodules: List of submodule names to perform QAT on. Leave None to quantize
         entire model. Default is None
     :param model_fuse_fn_name: Name of model function to fuse the model in place prior
@@ -82,6 +87,7 @@ class QuantizationModifier(ScheduledModifier):
     def __init__(
         self,
         start_epoch: float = -1.0,
+        calibration_epochs: float = 0.0,
         submodules: Union[List[str], None] = None,
         model_fuse_fn_name: Union[str, None] = None,
         disable_quantization_observer_epoch: Union[float, None] = None,
@@ -104,6 +110,7 @@ class QuantizationModifier(ScheduledModifier):
         super().__init__(start_epoch=start_epoch, end_epoch=-1.0, end_comparator=-1)
 
         self._start_epoch = start_epoch
+        self._calibration_epochs = calibration_epochs
         self._submodules = submodules
         self._model_fuse_fn_name = model_fuse_fn_name
         self._model_fuse_fn_kwargs = model_fuse_fn_kwargs or {}
@@ -111,6 +118,8 @@ class QuantizationModifier(ScheduledModifier):
         self._freeze_bn_stats_epoch = freeze_bn_stats_epoch
 
         self._modules_to_quantize = None
+        self._frozen_param_names = set()
+        self._calibration_enabled = False
         self._quantization_observer_disabled = False
         self._bn_stats_frozen = False
 
@@ -262,6 +271,15 @@ class QuantizationModifier(ScheduledModifier):
             elif self._model_fuse_fn_name is None:  # default auto fn
                 self._model_fuse_fn_kwargs["inplace"] = True
                 fuse_module_conv_bn_relus(module, **self._model_fuse_fn_kwargs)
+
+            # freeze trainable parameters for calibration mode, if applicable
+            if self._calibration_epochs > 0:
+                for parameter_name, parameter in module.named_parameters():
+                    if parameter.requires_grad:
+                        parameter.requires_grad = False
+                        self._frozen_param_names.add(parameter_name)
+                self._calibration_enabled = True
+
             # prepare each module / submodule for quantization
             qconfig = get_qat_qconfig()
             for quant_module in self._modules_to_quantize:
@@ -273,6 +291,13 @@ class QuantizationModifier(ScheduledModifier):
                 # set model to QAT mode
                 torch_quantization.prepare_qat(quant_module, inplace=True)
 
+        if self._end_calibration_update_ready(epoch):
+            for parameter_name, parameter in module.named_parameters():
+                if parameter_name in self._frozen_param_names:
+                    parameter.requires_grad = True
+                    self._frozen_param_names.remove(parameter_name)
+            self._calibration_enabled = False
+
         if self._disable_quantization_observer_update_ready(epoch):
             for quant_module in self._modules_to_quantize:
                 quant_module.apply(torch_quantization.disable_observer)
@@ -282,6 +307,13 @@ class QuantizationModifier(ScheduledModifier):
             for quant_module in self._modules_to_quantize:
                 quant_module.apply(torch_intrinsic.qat.freeze_bn_stats)
             self._bn_stats_frozen = True
+
+    def _end_calibration_update_ready(self, epoch: float) -> bool:
+        return (
+            self._calibration_epochs > 0
+            and self._calibration_enabled
+            and epoch >= self._start_epoch + self._calibration_epochs
+        )
 
     def _disable_quantization_observer_update_ready(self, epoch: float) -> bool:
         return (
@@ -313,6 +345,7 @@ class QuantizationModifier(ScheduledModifier):
 
         pending = (
             self.start_pending(epoch, steps_per_epoch)
+            or self._end_calibration_update_ready(epoch)
             or self._disable_quantization_observer_update_ready(epoch)
             or self._freeze_bn_stats_update_ready(epoch)
         )
