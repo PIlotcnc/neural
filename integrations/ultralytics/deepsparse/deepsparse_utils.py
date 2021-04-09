@@ -28,6 +28,7 @@ import numpy
 import onnx
 import torch
 
+from deepsparse import compile_model
 from sparseml.onnx.utils import get_tensor_dim_shape, set_tensor_dim_shape
 from sparsezoo import Zoo
 
@@ -38,6 +39,7 @@ from utils.general import non_max_suppression
 __all__ = [
     "load_image",
     "YoloPostprocessor",
+    "DeepSparseYoloEngine",
     "postprocess_nms",
 ]
 
@@ -116,6 +118,113 @@ class YoloPostprocessor:
         return self._grids[grid_shape]
 
 
+_YOLO_CLASSES = [
+    "person",
+    "bicycle",
+    "car",
+    "motorcycle",
+    "airplane",
+    "bus",
+    "train",
+    "truck",
+    "boat",
+    "traffic light",
+    "fire hydrant",
+    "stop sign",
+    "parking meter",
+    "bench",
+    "bird",
+    "cat",
+    "dog",
+    "horse",
+    "sheep",
+    "cow",
+    "elephant",
+    "bear",
+    "zebra",
+    "giraffe",
+    "backpack",
+    "umbrella",
+    "handbag",
+    "tie",
+    "suitcase",
+    "frisbee",
+    "skis",
+    "snowboard",
+    "sports ball",
+    "kite",
+    "baseball bat",
+    "baseball glove",
+    "skateboard",
+    "surfboard",
+    "tennis racket",
+    "bottle",
+    "wine glass",
+    "cup",
+    "fork",
+    "knife",
+    "spoon",
+    "bowl",
+    "banana",
+    "apple",
+    "sandwich",
+    "orange",
+    "broccoli",
+    "carrot",
+    "hot dog",
+    "pizza",
+    "donut",
+    "cake",
+    "chair",
+    "couch",
+    "potted plant",
+    "bed",
+    "dining table",
+    "toilet",
+    "tv",
+    "laptop",
+    "mouse",
+    "remote",
+    "keyboard",
+    "cell phone",
+    "microwave",
+    "oven",
+    "toaster",
+    "sink",
+    "refrigerator",
+    "book",
+    "clock",
+    "vase",
+    "scissors",
+    "teddy bear",
+    "hair drier",
+    "toothbrush",
+]
+
+
+class DeepSparseYoloEngine:
+
+    def __init__(
+        self,
+        onnx_path: str,
+        image_size: int = 640,
+        batch_size=1,
+        num_cores=None
+    ):
+        image_shape = (image_size, image_size)
+        onnx_path, _ = modify_yolo_onnx_input_shape(onnx_path, image_shape)
+        self.model = compile_model(
+            onnx_path, batch_size=batch_size, num_cores=num_cores
+        )
+        self.postprocessor = YoloPostprocessor(image_shape)
+        self.stride = _get_stride(onnx_path)
+        self.names = _YOLO_CLASSES
+
+    def forward(self, image) -> torch.Tensor:
+        outputs = self.model.run([image])
+        return self.postprocessor.pre_nms_postprocess(outputs)
+
+
 def postprocess_nms(outputs: torch.Tensor) -> List[numpy.ndarray]:
     """
     :param outputs: Tensor of post-processed model outputs
@@ -181,3 +290,16 @@ def modify_yolo_onnx_input_shape(
     )
 
     return tmp_file.name, tmp_file
+
+
+def _get_stride(model_path: str) -> List[int]:
+    model = onnx.load(model_path)
+    model_input = model.graph.input[0]
+
+    initial_size = get_tensor_dim_shape(model_input, 2)
+    return [
+        int(initial_size / get_tensor_dim_shape(output, 2))
+        for output
+        in model.graph.output
+    ]
+
